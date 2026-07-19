@@ -45,7 +45,6 @@ jobs:
             libelf-dev libz-dev
           echo "java: $(java -version 2>&1 | head -1)"
 
-      # ================= 缓存 .repo 目录以加速同步 =================
       - name: 缓存 TWRP .repo (加速同步)
         id: cache-repo
         uses: actions/cache@v4
@@ -54,7 +53,6 @@ jobs:
           key: twrp-repo-${{ inputs.manifest_branch }}-${{ github.run_id }}
           restore-keys: |
             twrp-repo-${{ inputs.manifest_branch }}-
-      # ==================================================================
 
       - name: 同步 TWRP 源码
         run: |
@@ -91,34 +89,35 @@ jobs:
           echo "=== device tree 文件列表 ==="
           find device/xiaomi/rothko -maxdepth 2 -type f | sort
 
-      - name: 诊断:构建系统检查
-        run: |
-          cd ~/fox
-          echo "=== release 配置 ==="
-          ls build/release/release_configs/ 2>/dev/null || echo "build/release/release_configs/ 不存在"
-          echo ""
-          echo "=== device tree AndroidProducts.mk ==="
-          cat device/xiaomi/rothko/AndroidProducts.mk 2>/dev/null || echo "未找到 AndroidProducts.mk"
-
       - name: 补全 release config 并编译
         run: |
           cd ~/fox
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
 
-          # ---- 强制补全 TWRP manifest 缺失的 release config ----
-          # 修复：移除 Heredoc，改用 echo 避免 YAML 缩进导致的 Bash 语法错误
+          # ---- 1. 强制补全 TWRP manifest 缺失的 release config ----
           mkdir -p build/release/release_configs
           for rel in ap1a ap2a ap3a ap4a; do
             if [ ! -f "build/release/release_configs/${rel}.mk" ]; then
               echo ">>> 创建缺失的 release config: ${rel}.mk"
-              echo "# Dummy release config for TWRP build" > "build/release/release_configs/${rel}.mk"
+              echo "RELEASE_PLATFORM_VERSION := 14" > "build/release/release_configs/${rel}.mk"
+              echo "RELEASE_PLATFORM_VERSION_CODENAME := UpsideDownCake" >> "build/release/release_configs/${rel}.mk"
               echo "RELEASE_DEFAULT_PRODUCT := aosp_product" >> "build/release/release_configs/${rel}.mk"
             fi
           done
           echo ">>> 当前 release configs: $(ls build/release/release_configs/)"
 
-          # ---- 初始化构建环境 ----
+          # ---- 2. 修复 Device Tree 的 lunch 格式 (Android 14 强制要求三段式) ----
+          if grep -q "twrp_rothko-eng" device/xiaomi/rothko/AndroidProducts.mk 2>/dev/null; then
+            echo ">>> 修补 AndroidProducts.mk 以支持 Android 14 三段式 lunch"
+            sed -i 's/twrp_rothko-user/twrp_rothko-ap1a-user/g' device/xiaomi/rothko/AndroidProducts.mk
+            sed -i 's/twrp_rothko-userdebug/twrp_rothko-ap1a-userdebug/g' device/xiaomi/rothko/AndroidProducts.mk
+            sed -i 's/twrp_rothko-eng/twrp_rothko-ap1a-eng/g' device/xiaomi/rothko/AndroidProducts.mk
+          fi
+          echo "=== 修复后的 AndroidProducts.mk ==="
+          cat device/xiaomi/rothko/AndroidProducts.mk
+
+          # ---- 3. 初始化构建环境 ----
           ENVSETUP=""
           if [ -f build/envsetup.sh ]; then
             ENVSETUP="build/envsetup.sh"
@@ -131,11 +130,18 @@ jobs:
           echo ">>> source $ENVSETUP"
           source "$ENVSETUP"
 
-          # ---- 尝试 lunch (改进检测逻辑) ----
+          # ---- 4. 尝试 lunch (增加 || true 防止意外退出，并打印详细日志) ----
           LUNCH_OK=0
           for rel in ap1a ap2a ap3a ap4a; do
+            echo ""
             echo ">>> 尝试 lunch twrp_rothko-${rel}-eng"
-            lunch twrp_rothko-${rel}-eng > /tmp/lunch_out.txt 2>&1
+            # 使用 || true 确保即使 lunch 失败也不会直接终止脚本，而是继续执行并打印日志
+            lunch twrp_rothko-${rel}-eng > /tmp/lunch_out.txt 2>&1 || true
+            
+            echo "=== Lunch 详细输出 ==="
+            cat /tmp/lunch_out.txt
+            echo "======================"
+            
             if [ -n "$TARGET_PRODUCT" ] && [ "$TARGET_PRODUCT" = "twrp_rothko" ]; then
               echo ">>> SUCCESS: twrp_rothko-${rel}-eng"
               LUNCH_OK=1
@@ -144,26 +150,11 @@ jobs:
           done
 
           if [ "$LUNCH_OK" != 1 ]; then
-            echo ">>> 新式 lunch 失败，尝试旧式两段式"
-            for combo in twrp_rothko-eng omni_rothko-eng; do
-              echo ">>> 尝试 lunch ${combo}"
-              lunch ${combo} > /tmp/lunch_out.txt 2>&1
-              if [ -n "$TARGET_PRODUCT" ] && [[ "$TARGET_PRODUCT" == *"rothko"* ]]; then
-                echo ">>> SUCCESS: ${combo}"
-                LUNCH_OK=1
-                break
-              fi
-            done
-          fi
-
-          if [ "$LUNCH_OK" != 1 ]; then
             echo "!!! 所有 lunch 组合均失败"
-            echo "=== Lunch 输出日志 ==="
-            cat /tmp/lunch_out.txt
             exit 1
           fi
 
-          # ---- 编译 ----
+          # ---- 5. 编译 ----
           echo ""
           echo ">>> 开始编译 (CPU cores: $(nproc))"
           mka recoveryimage -j"$(nproc)" 2>&1 | tail -50
