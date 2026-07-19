@@ -48,7 +48,6 @@ jobs:
             libelf-dev libz-dev
           echo "java: $(java -version 2>&1 | head -1)"
 
-      # ================= 改为缓存 ccache (编译缓存) =================
       - name: 缓存 CCACHE (加速编译)
         id: cache-ccache
         uses: actions/cache@v4
@@ -57,7 +56,6 @@ jobs:
           key: ccache-twrp-${{ inputs.manifest_branch }}-${{ github.run_id }}
           restore-keys: |
             ccache-twrp-${{ inputs.manifest_branch }}-
-      # =================================================================
 
       - name: 同步 TWRP 源码
         run: |
@@ -100,38 +98,35 @@ jobs:
             echo "RELEASE_DEFAULT_PRODUCT := aosp_product" >> "build/release/release_configs/${rel}.mk"
           done
 
-          # ---- 2. 强制重写 Device Tree 的 AndroidProducts.mk (解决 lunch 找不到设备的问题) ----
+          # ---- 2. 强制重写 Device Tree 的 AndroidProducts.mk ----
           cd device/xiaomi/rothko
           echo ">>> 原始 Device Tree 文件:"
           ls -la *.mk 2>/dev/null
           
-          # 找到实际的 product mk 文件 (如 omni_rothko.mk)
           PRODUCT_MK=$(ls *.mk 2>/dev/null | grep -v "AndroidProducts.mk" | grep -v "BoardConfig.mk" | head -1)
           if [ -z "$PRODUCT_MK" ]; then
             echo "!!! 找不到 product mk 文件，尝试创建空的 twrp_rothko.mk"
             touch twrp_rothko.mk
           else
             echo ">>> 发现 product mk: $PRODUCT_MK"
-            # 确保存在 twrp_rothko.mk
             if [ "$PRODUCT_MK" != "twrp_rothko.mk" ]; then
               cp "$PRODUCT_MK" "twrp_rothko.mk"
               echo ">>> 已复制为 twrp_rothko.mk"
             fi
           fi
 
-          # 彻底重写 AndroidProducts.mk，注入 Android 14 必需的三段式 lunch 选项
-          cat > AndroidProducts.mk << 'EOF'
-PRODUCT_MAKEFILES := \
-    $(LOCAL_DIR)/twrp_rothko.mk
-
-COMMON_LUNCH_CHOICES := \
-    twrp_rothko-ap1a-eng \
-    twrp_rothko-ap1a-user \
-    twrp_rothko-ap1a-userdebug \
-    twrp_rothko-ap2a-eng \
-    twrp_rothko-ap3a-eng \
-    twrp_rothko-ap4a-eng
-EOF
+          # 彻底重写 AndroidProducts.mk (使用 echo 避免 Heredoc 缩进问题)
+          echo "PRODUCT_MAKEFILES := \\" > AndroidProducts.mk
+          echo "    \$(LOCAL_DIR)/twrp_rothko.mk" >> AndroidProducts.mk
+          echo "" >> AndroidProducts.mk
+          echo "COMMON_LUNCH_CHOICES := \\" >> AndroidProducts.mk
+          echo "    twrp_rothko-ap1a-eng \\" >> AndroidProducts.mk
+          echo "    twrp_rothko-ap1a-user \\" >> AndroidProducts.mk
+          echo "    twrp_rothko-ap1a-userdebug \\" >> AndroidProducts.mk
+          echo "    twrp_rothko-ap2a-eng \\" >> AndroidProducts.mk
+          echo "    twrp_rothko-ap3a-eng \\" >> AndroidProducts.mk
+          echo "    twrp_rothko-ap4a-eng" >> AndroidProducts.mk
+          
           echo ">>> 已重写 AndroidProducts.mk，内容如下："
           cat AndroidProducts.mk
           cd ~/fox
@@ -174,7 +169,6 @@ EOF
           echo ">>> 开始编译 (CPU cores: $(nproc))"
           mka recoveryimage -j"$(nproc)" 2>&1 | tail -100
           
-          # 打印 ccache 统计
           ccache -s
 
       - name: 上传产物
