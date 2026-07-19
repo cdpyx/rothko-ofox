@@ -91,31 +91,42 @@ jobs:
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
 
-          # ---- 1. 强制补全 release config ----
-          mkdir -p build/release/release_configs
+          # ---- 1. 强制补全 release config (修复：必须放在 build/release/ 根目录，而非子目录) ----
+          mkdir -p build/release
           for rel in ap1a ap2a ap3a ap4a; do
-            echo "RELEASE_PLATFORM_VERSION := 14" > "build/release/release_configs/${rel}.mk"
-            echo "RELEASE_DEFAULT_PRODUCT := aosp_product" >> "build/release/release_configs/${rel}.mk"
+            echo ">>> 创建 release config: build/release/${rel}.mk"
+            echo "RELEASE_PLATFORM_VERSION := 14" > "build/release/${rel}.mk"
+            echo "RELEASE_PLATFORM_VERSION_CODENAME := UpsideDownCake" >> "build/release/${rel}.mk"
+            echo "RELEASE_PLATFORM_SDK_VERSION := 34" >> "build/release/${rel}.mk"
+            echo "RELEASE_DEFAULT_PRODUCT := aosp_product" >> "build/release/${rel}.mk"
           done
+          echo ">>> 当前 release configs: $(ls build/release/*.mk)"
 
-          # ---- 2. 强制重写 Device Tree 的 AndroidProducts.mk ----
+          # ---- 2. 修正 Device Tree 的 Product MK 查找逻辑 (修复：不再错误覆盖为 Android.mk) ----
           cd device/xiaomi/rothko
           echo ">>> 原始 Device Tree 文件:"
           ls -la *.mk 2>/dev/null
           
-          PRODUCT_MK=$(ls *.mk 2>/dev/null | grep -v "AndroidProducts.mk" | grep -v "BoardConfig.mk" | head -1)
-          if [ -z "$PRODUCT_MK" ]; then
-            echo "!!! 找不到 product mk 文件，尝试创建空的 twrp_rothko.mk"
-            touch twrp_rothko.mk
+          # 优先使用已存在的 twrp_rothko.mk 或 omni_rothko.mk
+          if [ -f "twrp_rothko.mk" ]; then
+            echo ">>> 找到并保留现有的 twrp_rothko.mk"
+          elif [ -f "omni_rothko.mk" ]; then
+            echo ">>> 找到 omni_rothko.mk，复制为 twrp_rothko.mk"
+            cp "omni_rothko.mk" "twrp_rothko.mk"
           else
-            echo ">>> 发现 product mk: $PRODUCT_MK"
-            if [ "$PRODUCT_MK" != "twrp_rothko.mk" ]; then
+            # 兜底：寻找包含 rothko 的 mk 文件，排除 Android.mk 和 BoardConfig.mk
+            PRODUCT_MK=$(ls *rothko*.mk 2>/dev/null | grep -v "AndroidProducts.mk" | grep -v "BoardConfig.mk" | grep -v "Android.mk" | head -1)
+            if [ -n "$PRODUCT_MK" ]; then
+              echo ">>> 找到 $PRODUCT_MK，复制为 twrp_rothko.mk"
               cp "$PRODUCT_MK" "twrp_rothko.mk"
-              echo ">>> 已复制为 twrp_rothko.mk"
+            else
+              echo "!!! 找不到任何有效的 product mk 文件，创建空白 twrp_rothko.mk"
+              echo "PRODUCT_NAME := twrp_rothko" > twrp_rothko.mk
+              echo "PRODUCT_DEVICE := rothko" >> twrp_rothko.mk
             fi
           fi
 
-          # 彻底重写 AndroidProducts.mk (使用 echo 避免 Heredoc 缩进问题)
+          # ---- 3. 彻底重写 AndroidProducts.mk (使用 echo 避免 Heredoc 缩进问题) ----
           echo "PRODUCT_MAKEFILES := \\" > AndroidProducts.mk
           echo "    \$(LOCAL_DIR)/twrp_rothko.mk" >> AndroidProducts.mk
           echo "" >> AndroidProducts.mk
@@ -131,7 +142,7 @@ jobs:
           cat AndroidProducts.mk
           cd ~/fox
 
-          # ---- 3. 初始化构建环境 ----
+          # ---- 4. 初始化构建环境 ----
           ENVSETUP="build/envsetup.sh"
           [ ! -f "$ENVSETUP" ] && ENVSETUP="build/make/envsetup.sh"
           echo ">>> source $ENVSETUP"
@@ -141,7 +152,7 @@ jobs:
           ccache -M 10G
           ccache -z
 
-          # ---- 4. 尝试 lunch (带详细日志) ----
+          # ---- 5. 尝试 lunch (带详细日志) ----
           LUNCH_OK=0
           for rel in ap1a ap2a ap3a ap4a; do
             echo ""
@@ -164,7 +175,7 @@ jobs:
             exit 1
           fi
 
-          # ---- 5. 编译 ----
+          # ---- 6. 编译 ----
           echo ""
           echo ">>> 开始编译 (CPU cores: $(nproc))"
           mka recoveryimage -j"$(nproc)" 2>&1 | tail -100
