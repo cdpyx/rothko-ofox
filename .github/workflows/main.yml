@@ -47,13 +47,23 @@ jobs:
 
       - name: 同步 TWRP 源码
         run: |
+          set -eo pipefail
           mkdir -p ~/fox && cd ~/fox
           echo "=== repo init (branch: ${{ inputs.manifest_branch }}) ==="
           repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp.git \
             -b ${{ inputs.manifest_branch }} \
             --depth=1 2>&1 | tail -5
-          echo "=== repo sync ==="
-          repo sync -j$(nproc) --force-sync --no-tags --no-clone-bundle 2>&1 | tail -20
+          echo "=== repo sync (may take 30-60 min) ==="
+          repo sync -c --no-tags --no-clone-bundle --force-sync -j$(nproc) 2>&1 | tail -30
+          echo "=== 验证同步完整性 ==="
+          # build/envsetup.sh 必须在 build/ 下，否则构建会失败
+          if [ ! -f build/envsetup.sh ] && [ ! -f build/make/envsetup.sh ]; then
+            echo "!!! envsetup.sh 不存在，repo sync 不完整，重试一次..."
+            repo sync -c --force-sync -j$(nproc) 2>&1 | tail -30
+          fi
+          echo "=== 关键文件检查 ==="
+          ls -la build/envsetup.sh build/make/envsetup.sh 2>/dev/null || echo "!! 仍缺少 envsetup.sh"
+          ls build/ 2>/dev/null | head -20
           echo "=== 同步完成，磁盘使用 ==="
           df -h /
           du -sh ~/fox 2>/dev/null
@@ -113,7 +123,29 @@ jobs:
           fi
 
           # ---- 初始化构建环境 ----
-          source build/envsetup.sh
+          # envsetup.sh 可能在 build/ 或 build/make/ 下
+          ENVSETUP=""
+          if [ -f build/envsetup.sh ]; then
+            ENVSETUP="build/envsetup.sh"
+          elif [ -f build/make/envsetup.sh ]; then
+            echo ">>> build/envsetup.sh 不存在，使用 build/make/envsetup.sh"
+            ENVSETUP="build/make/envsetup.sh"
+          else
+            echo "!!! envsetup.sh 完全不存在！build/ 目录内容:"
+            ls -la build/ 2>/dev/null | head -10
+            echo ">>> 重新运行 repo sync..."
+            repo sync -c build build/make --force-sync 2>&1 | tail -10
+            if [ -f build/envsetup.sh ]; then
+              ENVSETUP="build/envsetup.sh"
+            elif [ -f build/make/envsetup.sh ]; then
+              ENVSETUP="build/make/envsetup.sh"
+            else
+              echo "!!! repo sync 后仍无 envsetup.sh，终止"
+              exit 1
+            fi
+          fi
+          echo ">>> source $ENVSETUP"
+          source "$ENVSETUP"
 
           # ---- 尝试 lunch ----
           LUNCH_OK=0
