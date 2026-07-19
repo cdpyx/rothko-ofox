@@ -1,174 +1,169 @@
-name: OrangeFox rothko
+name: Build TWRP for rothko (Xiaomi 15T Pro)
 
 on:
   workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: 'TWRP manifest branch'
+        required: true
+        default: 'twrp-14'
+      device_tree_repo:
+        description: 'Device tree repo URL'
+        required: true
+        default: 'https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp'
+
+env:
+  ALLOW_MISSING_DEPENDENCIES: true
+  LC_ALL: C
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    env:
-      GIT_TERMINAL_PROMPT: 0
+
     steps:
-      - name: 释放磁盘空间
+      - name: 清理磁盘空间
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-                      /usr/local/share/boost /opt/hostedtoolcache \
-                      /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker rmi $(sudo docker images -aq) 2>/dev/null || true
+          echo "=== 清理前 ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          echo "=== 清理后 ==="
           df -h /
 
-      - name: 安装依赖 + 最新 repo 工具
+      - name: 安装依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y git-core gnupg flex bison build-essential \
-            zip curl zlib1g-dev libxml2-utils xsltproc unzip fontconfig \
-            python3 bc lz4 lzop cpio rsync libssl-dev
-          # apt 源的 repo 太老,装官方最新版
-          sudo curl -sL -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
-          sudo chmod +x /usr/local/bin/repo
-          hash -r
-          repo --version
-          git config --global user.email "ci@build.local"
-          git config --global user.name "ci"
-          git config --global credential.helper ""
+          sudo apt-get install -y \
+            git repo python3 openjdk-17-jdk \
+            gcc g++ make lz4 cpio \
+            zip unzip curl wget \
+            bc bison flex libssl-dev \
+            libncurses-dev mtools \
+            dosfstools e2fsprogs \
+            rsync xz-utils \
+            libelf-dev libz-dev
+          echo "java: $(java -version 2>&1 | head -1)"
 
-      - name: 打底:TWRP 官方 minimal manifest (twrp-14)
+      - name: 同步 TWRP 源码
         run: |
-          set +e
           mkdir -p ~/fox && cd ~/fox
-          OK=0
-          for br in twrp-14 twrp-14.1 twrp-15; do
-            echo "########## repo init minimal-manifest -b $br ##########"
-            rm -rf .repo
-            repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b "$br" || continue
-            repo sync -c -j"$(nproc)" --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune || continue
-            [ -d build ] && [ -d bootable ] && { OK=1; echo "打底成功: $br"; break; }
-          done
-          [ "$OK" = 1 ] || { echo "TWRP manifest 也拉不到,无法继续"; exit 1; }
+          echo "=== repo init (branch: ${{ inputs.manifest_branch }}) ==="
+          repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp.git \
+            -b ${{ inputs.manifest_branch }} \
+            --depth=1 2>&1 | tail -5
+          echo "=== repo sync ==="
+          repo sync -j$(nproc) --force-sync --no-tags --no-clone-bundle 2>&1 | tail -20
+          echo "=== 同步完成，磁盘使用 ==="
+          df -h /
+          du -sh ~/fox 2>/dev/null
 
-      - name: 覆盖橙狐层 (vendor/fox + recovery fork)
-        run: |
-          set +e
-          cd ~/fox
-          # --- vendor/fox ---
-          FOXVEND=0
-          for url in https://gitlab.com/orangefox/vendor.git \
-                     https://github.com/OrangeFoxRecovery/vendor.git \
-                     https://github.com/OrangeFoxRecovery/fox_vendor.git; do
-            for br in fox_14.1 master main; do
-              echo "### 试 vendor: $url -b $br"
-              rm -rf /tmp/fv
-              if git clone --depth=1 -b "$br" "$url" /tmp/fv 2>&1 | tail -2; [ -d /tmp/fv ]; then
-                rm -rf vendor/fox
-                cp -a /tmp/fv vendor/fox
-                FOXVEND=1; echo "vendor/fox 成功: $url -b $br"
-                break 2
-              fi
-            done
-          done
-          # --- bootable/recovery 换成橙狐 fork ---
-          FOXREC=0
-          for url in https://gitlab.com/orangefox/recovery.git \
-                     https://github.com/OrangeFoxRecovery/bootable_recovery.git \
-                     https://github.com/OrangeFoxRecovery/recovery.git; do
-            for br in fox_14.1 master main; do
-              echo "### 试 recovery: $url -b $br"
-              rm -rf /tmp/fr
-              if git clone --depth=1 -b "$br" "$url" /tmp/fr 2>&1 | tail -2; [ -d /tmp/fr ]; then
-                rm -rf bootable/recovery
-                cp -a /tmp/fr bootable/recovery
-                FOXREC=1; echo "recovery fork 成功: $url -b $br"
-                break 2
-              fi
-            done
-          done
-          echo "======== 橙狐层状态: vendor=$FOXVEND recovery=$FOXREC ========"
-          echo "(都是0则按纯 TWRP 编译,功能一样)"
-          ls vendor/ 2>/dev/null
-          exit 0
-
-      - name: 拉取 rothko device tree 并转橙狐
+      - name: 克隆 Device Tree
         run: |
           cd ~/fox
-          git clone --depth=1 \
-            https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp \
-            device/xiaomi/rothko
-          cd device/xiaomi/rothko
-          echo "=== 原始 mk 文件 ==="
-          ls *.mk
-          if [ -d ~/fox/vendor/fox ]; then
-            SRC=$(ls twrp_rothko.mk omni_rothko.mk 2>/dev/null | head -1)
-            echo "源产品文件: $SRC (转橙狐)"
-            sed -e 's#vendor/twrp/config/common.mk#vendor/fox/config/common.mk#g' \
-                -e 's#vendor/lineage/config/common.mk#vendor/fox/config/common.mk#g' \
-                -e 's#PRODUCT_NAME := .*#PRODUCT_NAME := fox_rothko#' "$SRC" > fox_rothko.mk
-            cat fox_rothko.mk
-            {
-              echo '#!/bin/bash'
-              echo 'export FOX_BUILD_TYPE=Beta'
-              echo 'export OF_MAINTAINER="rothko-port"'
-              echo 'export OF_USE_MAGISKBOOT=1'
-            } > vendorsetup.sh
-          else
-            echo "无 vendor/fox,按 TWRP 编译"
-          fi
+          mkdir -p device/xiaomi/rothko
+          echo "=== cloning ${{ inputs.device_tree_repo }} ==="
+          git clone --depth=1 ${{ inputs.device_tree_repo }} device/xiaomi/rothko 2>&1 | tail -5
+          echo "=== device tree 文件列表 ==="
+          find device/xiaomi/rothko -maxdepth 2 -type f | sort
 
+      - name: 诊断:构建系统检查
+        run: |
+          cd ~/fox
+          echo "=== twrp-14 manifest 分支 ==="
+          git -C build/make branch -a 2>/dev/null | head -5
+          echo ""
+          echo "=== release 配置 ==="
+          ls build/release/ 2>/dev/null || echo "build/release/ 不存在"
+          find build -path '*/release*' -name '*.mk' 2>/dev/null | head -10
+          echo ""
+          echo "=== AOSP 版本 ==="
+          grep -E 'PLATFORM_VERSION\b' build/core/version_defaults.mk 2>/dev/null | head -3 || \
+            grep -rE 'PLATFORM_VERSION\b' build/make/core/version_defaults.mk 2>/dev/null | head -3 || \
+            echo "version_defaults.mk 未找到"
+          echo ""
+          echo "=== device tree AndroidProducts.mk ==="
+          cat device/xiaomi/rothko/AndroidProducts.mk
+          echo ""
+          echo "=== BoardConfig 中的 release/target 相关 ==="
+          grep -iE 'release|target_product|common_lunch' device/xiaomi/rothko/BoardConfig.mk 2>/dev/null | head -10
 
-      - name: 编译
+      - name: 补全 release config 并编译
         run: |
           cd ~/fox
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
 
-          echo "=== 构建系统诊断 ==="
-          echo "--- AndroidProducts.mk ---"
-          cat device/xiaomi/rothko/AndroidProducts.mk
-          echo "--- 产品名映射 ---"
-          grep -E 'PRODUCT_NAME|PRODUCT_DEVICE|COMMON_LUNCH' device/xiaomi/rothko/*.mk
-          echo "--- release configs ---"
-          ls build/release/ 2>/dev/null || echo "no build/release/"
-          find build -path '*/release/*' -name '*.mk' 2>/dev/null | head -10
-          echo "--- AOSP 版本 ---"
-          grep -E 'PLATFORM_VERSION\b' build/core/version_defaults.mk 2>/dev/null | head -3
-          echo "--- .repo/manifests 的 branch ---"
-          git -C .repo/manifests branch -a 2>/dev/null | head -5
+          # ---- 补全 TWRP manifest 缺失的 release config ----
+          if [ ! -d build/release ]; then
+            echo ">>> build/release/ 不存在，创建最小 release config"
+            mkdir -p build/release/release_configs
 
+            # 创建多个常见 release name，lunch 时按 TARGET_RELEASE 匹配
+            for rel in ap1a ap2a ap3a ap4a; do
+              cat > "build/release/release_configs/${rel}.mk" <<'RELEOF'
+          PRODUCT_SOONG_NAMESPACES += build/release
+          $(call inherit-product, build/make/target/product/aosp_product.mk)
+          RELEASE_DEFAULT_PRODUCT := aosp_product
+          RELEOF
+            done
+            echo ">>> 已创建: $(ls build/release/release_configs/)"
+          else
+            echo ">>> build/release/ 已存在: $(ls build/release/release_configs/ 2>/dev/null)"
+          fi
+
+          # ---- 初始化构建环境 ----
           source build/envsetup.sh
 
-          echo "=== envsetup 注册的产品 ==="
-          gettop >/dev/null 2>&1 && echo "TOP=$(gettop)" || echo "gettop failed"
-
-          echo "=== 尝试 lunch combos ==="
+          # ---- 尝试 lunch ----
           LUNCH_OK=0
-          # 新式三段 (product-release-variant)
-          for prod in twrp_rothko omni_rothko; do
-            for rel in ap2a ap3a ap4a ap1a; do
-              echo "### lunch ${prod}-${rel}-eng"
-              if lunch ${prod}-${rel}-eng 2>&1; then
-                LUNCH_OK=1; break 2
-              fi
-            done
+          # 优先: 新式三段式 product-release-variant
+          for rel in ap1a ap2a ap3a ap4a; do
+            echo ""
+            echo ">>> lunch twrp_rothko-${rel}-eng"
+            if lunch twrp_rothko-${rel}-eng 2>&1; then
+              echo ">>> SUCCESS: twrp_rothko-${rel}-eng"
+              LUNCH_OK=1
+              break
+            fi
           done
-          # 旧式两段 (product-variant)
+
           if [ "$LUNCH_OK" != 1 ]; then
-            for prod in twrp_rothko omni_rothko; do
-              echo "### lunch ${prod}-eng (old style)"
-              if lunch ${prod}-eng 2>&1; then
-                LUNCH_OK=1; break
+            echo ""
+            echo ">>> 新式 lunch 全部失败"
+            echo ">>> 尝试旧式两段 product-variant"
+            for combo in twrp_rothko-eng omni_rothko-eng; do
+              echo ""
+              echo ">>> lunch ${combo}"
+              if lunch ${combo} 2>&1; then
+                echo ">>> SUCCESS: ${combo}"
+                LUNCH_OK=1
+                break
               fi
             done
           fi
-          [ "$LUNCH_OK" = 1 ] || exit 1
 
-          mka bootimage -j"$(nproc)" || mka recoveryimage -j"$(nproc)"
-          echo "=== 产物 ==="
-          ls -la out/target/product/rothko/*.img 2>/dev/null
+          if [ "$LUNCH_OK" != 1 ]; then
+            echo ""
+            echo "!!! 所有 lunch 组合均失败"
+            echo "=== 已注册的 lunch choices ==="
+            get_build_var COMMON_LUNCH_CHOICES 2>/dev/null || echo "get_build_var failed"
+            exit 1
+          fi
+
+          # ---- 编译 ----
+          echo ""
+          echo ">>> 开始编译 (CPU cores: $(nproc))"
+          mka bootimage -j"$(nproc)" 2>&1 | tail -30 || \
+            mka recoveryimage -j"$(nproc)" 2>&1 | tail -30
 
       - name: 上传产物
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: orangefox-rothko
-          path: ~/fox/out/target/product/rothko/*.img
+          name: twrp-rothko
+          path: |
+            ~/fox/out/target/product/rothko/*.img
+            ~/fox/out/target/product/rothko/recovery*.img
+            ~/fox/out/target/product/rothko/boot*.img
           if-no-files-found: warn
