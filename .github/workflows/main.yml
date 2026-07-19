@@ -1,7 +1,6 @@
 name: OrangeFox rothko
 
-on:
-  workflow_dispatch:
+
 
 jobs:
   build:
@@ -20,19 +19,50 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y repo git-core gnupg flex bison build-essential \
-            zip curl zlib1g-dev libncurses5 lib32ncurses-dev libxml2-utils \
-            xsltproc unzip fontconfig python3 bc lz4 lzop cpio rsync
+            zip curl zlib1g-dev libxml2-utils xsltproc unzip fontconfig \
+            python3 bc lz4 lzop cpio rsync libssl-dev
 
-      - name: 初始化 OrangeFox fox_14.1 源码
+      - name: 同步 OrangeFox fox_14.1 源码
         run: |
           mkdir -p ~/fox && cd ~/fox
           repo init --depth=1 -u https://gitlab.com/orangefox/manifest.git -b fox_14.1
-          repo sy
-          # 自动探测 lunch 名 (omni_/twrp_/fox_ 开头)
-          COMBO=$(ls device/xiaomi/rothko/ | grep -E '^(omni|twrp|fox)_rothko\.mk$' | head -1 | sed 's/\.mk$//')
-          echo "检测到 lunch combo: ${COMBO}-eng"
-          lunch ${COMBO}-eng
-          # recovery 合并进 boot 的机器,产物是 boot.img;也兼容有独立 recovery 的情况
+          repo sync -c -j$(nproc) --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune
+
+      - name: 拉取 rothko device tree 并转成橙狐
+        run: |
+          cd ~/fox
+          git clone --depth=1 \
+            https://github.com/JonesqPacMan/android_device_xiaomi_rothko_
+            device/xiaomi/rothko
+          cd device/xiaomi/rothko
+          echo "=== 原始 mk 文件 ==="
+          ls *.mk
+          SRC=$(ls twrp_rothko.mk omni_rothko.mk 2>/dev/null | head -1)
+          echo "源产品文件: $SRC"
+          # 转换成橙狐:换 vendor 配置 + 改名
+          sed -e 's#vendor/twrp/config/common.mk#vendor/fox/config/common
+              -e 's#vendor/lineage/config/common.mk#vendor/fox/config/common.mk#g' \
+              -e 's#PRODUCT_NAME := .*#PRODUCT_NAME := fox_rothko#' "$SRC" > fox_rothko.mk
+          echo "=== 生成的 fox_rothko.mk ==="
+          cat fox_rothko.mk
+          # 橙狐构建变量
+          {
+            echo '#!/bin/bash'
+            echo 'export FOX_BUILD_TYPE=Beta'
+            echo 'export OF_MAINTAINER="rothko-port"'
+            echo 'export OF_USE_MAGISKBOOT=1'
+          } > vendorsetup.sh
+          echo "=== vendorsetup.sh ==="
+          cat vendorsetup.sh
+
+      - name: 编译 OrangeFox
+        run: |
+          cd ~/fox
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          source build/envsetup.sh
+          lunch fox_rothko-eng
+          # recovery 合并进 boot 的机器产物是 boot.img;失败则试 recoveryi
           mka bootimage -j$(nproc) || mka recoveryimage -j$(nproc)
           echo "=== 产物 ==="
           ls -la out/target/product/rothko/*.img
