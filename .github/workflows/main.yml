@@ -50,13 +50,13 @@ jobs:
           set -eo pipefail
           mkdir -p ~/fox && cd ~/fox
           echo "=== repo init (branch: ${{ inputs.manifest_branch }}) ==="
-          repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp.git \
+          # 修正：使用正确的 AOSP manifest 仓库
+          repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
             -b ${{ inputs.manifest_branch }} \
             --depth=1 2>&1 | tail -5
           echo "=== repo sync (may take 30-60 min) ==="
           repo sync -c --no-tags --no-clone-bundle --force-sync -j$(nproc) 2>&1 | tail -30
           echo "=== 验证同步完整性 ==="
-          # build/envsetup.sh 必须在 build/ 下，否则构建会失败
           if [ ! -f build/envsetup.sh ] && [ ! -f build/make/envsetup.sh ]; then
             echo "!!! envsetup.sh 不存在，repo sync 不完整，重试一次..."
             repo sync -c --force-sync -j$(nproc) 2>&1 | tail -30
@@ -108,8 +108,6 @@ jobs:
           if [ ! -d build/release ]; then
             echo ">>> build/release/ 不存在，创建最小 release config"
             mkdir -p build/release/release_configs
-
-            # 创建多个常见 release name，lunch 时按 TARGET_RELEASE 匹配
             for rel in ap1a ap2a ap3a ap4a; do
               cat > "build/release/release_configs/${rel}.mk" <<'RELEOF'
           PRODUCT_SOONG_NAMESPACES += build/release
@@ -123,7 +121,6 @@ jobs:
           fi
 
           # ---- 初始化构建环境 ----
-          # envsetup.sh 可能在 build/ 或 build/make/ 下
           ENVSETUP=""
           if [ -f build/envsetup.sh ]; then
             ENVSETUP="build/envsetup.sh"
@@ -149,7 +146,6 @@ jobs:
 
           # ---- 尝试 lunch ----
           LUNCH_OK=0
-          # 优先: 新式三段式 product-release-variant
           for rel in ap1a ap2a ap3a ap4a; do
             echo ""
             echo ">>> lunch twrp_rothko-${rel}-eng"
