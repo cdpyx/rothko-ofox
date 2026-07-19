@@ -15,6 +15,9 @@ on:
 env:
   ALLOW_MISSING_DEPENDENCIES: true
   LC_ALL: C
+  USE_CCACHE: 1
+  CCACHE_DIR: /home/runner/.ccache
+  CCACHE_EXEC: /usr/bin/ccache
 
 jobs:
   build:
@@ -35,7 +38,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git repo python3 openjdk-17-jdk \
+            git repo python3 openjdk-17-jdk ccache \
             gcc g++ make lz4 cpio \
             zip unzip curl wget \
             bc bison flex libssl-dev \
@@ -45,14 +48,16 @@ jobs:
             libelf-dev libz-dev
           echo "java: $(java -version 2>&1 | head -1)"
 
-      - name: 缓存 TWRP .repo (加速同步)
-        id: cache-repo
+      # ================= 改为缓存 ccache (编译缓存) =================
+      - name: 缓存 CCACHE (加速编译)
+        id: cache-ccache
         uses: actions/cache@v4
         with:
-          path: ~/fox/.repo
-          key: twrp-repo-${{ inputs.manifest_branch }}-${{ github.run_id }}
+          path: /home/runner/.ccache
+          key: ccache-twrp-${{ inputs.manifest_branch }}-${{ github.run_id }}
           restore-keys: |
-            twrp-repo-${{ inputs.manifest_branch }}-
+            ccache-twrp-${{ inputs.manifest_branch }}-
+      # =================================================================
 
       - name: 同步 TWRP 源码
         run: |
@@ -64,21 +69,16 @@ jobs:
             -b ${{ inputs.manifest_branch }} \
             --depth=1 2>&1 | tail -5
             
-          echo "=== repo sync (利用缓存加速) ==="
+          echo "=== repo sync ==="
           repo sync -c --no-tags --no-clone-bundle --force-sync -j$(nproc) 2>&1 | tail -30
-          
-          echo "=== 优化缓存体积 (Git GC) ==="
-          repo forall -c 'git gc --prune=now' 2>/dev/null || true
           
           echo "=== 验证同步完整性 ==="
           if [ ! -f build/envsetup.sh ] && [ ! -f build/make/envsetup.sh ]; then
-            echo "!!! envsetup.sh 不存在，repo sync 不完整，重试一次..."
+            echo "!!! envsetup.sh 不存在，重试..."
             repo sync -c --force-sync -j$(nproc) 2>&1 | tail -30
           fi
-          echo "=== 同步完成，磁盘使用 ==="
+          echo "=== 同步完成 ==="
           df -h /
-          du -sh ~/fox 2>/dev/null
-          du -sh ~/fox/.repo 2>/dev/null
 
       - name: 克隆 Device Tree
         run: |
@@ -86,61 +86,72 @@ jobs:
           mkdir -p device/xiaomi/rothko
           echo "=== cloning ${{ inputs.device_tree_repo }} ==="
           git clone --depth=1 ${{ inputs.device_tree_repo }} device/xiaomi/rothko 2>&1 | tail -5
-          echo "=== device tree 文件列表 ==="
-          find device/xiaomi/rothko -maxdepth 2 -type f | sort
 
-      - name: 补全 release config 并编译
+      - name: 补全 release config 并强制适配 Device Tree
         run: |
           cd ~/fox
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
 
-          # ---- 1. 强制补全 TWRP manifest 缺失的 release config ----
+          # ---- 1. 强制补全 release config ----
           mkdir -p build/release/release_configs
           for rel in ap1a ap2a ap3a ap4a; do
-            if [ ! -f "build/release/release_configs/${rel}.mk" ]; then
-              echo ">>> 创建缺失的 release config: ${rel}.mk"
-              echo "RELEASE_PLATFORM_VERSION := 14" > "build/release/release_configs/${rel}.mk"
-              echo "RELEASE_PLATFORM_VERSION_CODENAME := UpsideDownCake" >> "build/release/release_configs/${rel}.mk"
-              echo "RELEASE_DEFAULT_PRODUCT := aosp_product" >> "build/release/release_configs/${rel}.mk"
-            fi
+            echo "RELEASE_PLATFORM_VERSION := 14" > "build/release/release_configs/${rel}.mk"
+            echo "RELEASE_DEFAULT_PRODUCT := aosp_product" >> "build/release/release_configs/${rel}.mk"
           done
-          echo ">>> 当前 release configs: $(ls build/release/release_configs/)"
 
-          # ---- 2. 修复 Device Tree 的 lunch 格式 (Android 14 强制要求三段式) ----
-          if grep -q "twrp_rothko-eng" device/xiaomi/rothko/AndroidProducts.mk 2>/dev/null; then
-            echo ">>> 修补 AndroidProducts.mk 以支持 Android 14 三段式 lunch"
-            sed -i 's/twrp_rothko-user/twrp_rothko-ap1a-user/g' device/xiaomi/rothko/AndroidProducts.mk
-            sed -i 's/twrp_rothko-userdebug/twrp_rothko-ap1a-userdebug/g' device/xiaomi/rothko/AndroidProducts.mk
-            sed -i 's/twrp_rothko-eng/twrp_rothko-ap1a-eng/g' device/xiaomi/rothko/AndroidProducts.mk
+          # ---- 2. 强制重写 Device Tree 的 AndroidProducts.mk (解决 lunch 找不到设备的问题) ----
+          cd device/xiaomi/rothko
+          echo ">>> 原始 Device Tree 文件:"
+          ls -la *.mk 2>/dev/null
+          
+          # 找到实际的 product mk 文件 (如 omni_rothko.mk)
+          PRODUCT_MK=$(ls *.mk 2>/dev/null | grep -v "AndroidProducts.mk" | grep -v "BoardConfig.mk" | head -1)
+          if [ -z "$PRODUCT_MK" ]; then
+            echo "!!! 找不到 product mk 文件，尝试创建空的 twrp_rothko.mk"
+            touch twrp_rothko.mk
+          else
+            echo ">>> 发现 product mk: $PRODUCT_MK"
+            # 确保存在 twrp_rothko.mk
+            if [ "$PRODUCT_MK" != "twrp_rothko.mk" ]; then
+              cp "$PRODUCT_MK" "twrp_rothko.mk"
+              echo ">>> 已复制为 twrp_rothko.mk"
+            fi
           fi
-          echo "=== 修复后的 AndroidProducts.mk ==="
-          cat device/xiaomi/rothko/AndroidProducts.mk
+
+          # 彻底重写 AndroidProducts.mk，注入 Android 14 必需的三段式 lunch 选项
+          cat > AndroidProducts.mk << 'EOF'
+PRODUCT_MAKEFILES := \
+    $(LOCAL_DIR)/twrp_rothko.mk
+
+COMMON_LUNCH_CHOICES := \
+    twrp_rothko-ap1a-eng \
+    twrp_rothko-ap1a-user \
+    twrp_rothko-ap1a-userdebug \
+    twrp_rothko-ap2a-eng \
+    twrp_rothko-ap3a-eng \
+    twrp_rothko-ap4a-eng
+EOF
+          echo ">>> 已重写 AndroidProducts.mk，内容如下："
+          cat AndroidProducts.mk
+          cd ~/fox
 
           # ---- 3. 初始化构建环境 ----
-          ENVSETUP=""
-          if [ -f build/envsetup.sh ]; then
-            ENVSETUP="build/envsetup.sh"
-          elif [ -f build/make/envsetup.sh ]; then
-            ENVSETUP="build/make/envsetup.sh"
-          else
-            echo "!!! envsetup.sh 完全不存在！"
-            exit 1
-          fi
+          ENVSETUP="build/envsetup.sh"
+          [ ! -f "$ENVSETUP" ] && ENVSETUP="build/make/envsetup.sh"
           echo ">>> source $ENVSETUP"
           source "$ENVSETUP"
 
-          # ---- 4. 尝试 lunch (增加 || true 防止意外退出，并打印详细日志) ----
+          # 配置 ccache
+          ccache -M 10G
+          ccache -z
+
+          # ---- 4. 尝试 lunch (带详细日志) ----
           LUNCH_OK=0
           for rel in ap1a ap2a ap3a ap4a; do
             echo ""
             echo ">>> 尝试 lunch twrp_rothko-${rel}-eng"
-            # 使用 || true 确保即使 lunch 失败也不会直接终止脚本，而是继续执行并打印日志
             lunch twrp_rothko-${rel}-eng > /tmp/lunch_out.txt 2>&1 || true
-            
-            echo "=== Lunch 详细输出 ==="
-            cat /tmp/lunch_out.txt
-            echo "======================"
             
             if [ -n "$TARGET_PRODUCT" ] && [ "$TARGET_PRODUCT" = "twrp_rothko" ]; then
               echo ">>> SUCCESS: twrp_rothko-${rel}-eng"
@@ -150,14 +161,21 @@ jobs:
           done
 
           if [ "$LUNCH_OK" != 1 ]; then
-            echo "!!! 所有 lunch 组合均失败"
+            echo "!!! 所有 lunch 组合均失败，输出详细日志："
+            cat /tmp/lunch_out.txt
+            echo ""
+            echo "=== 当前系统识别的 LUNCH CHOICES ==="
+            get_build_var COMMON_LUNCH_CHOICES 2>/dev/null || echo "获取失败"
             exit 1
           fi
 
           # ---- 5. 编译 ----
           echo ""
           echo ">>> 开始编译 (CPU cores: $(nproc))"
-          mka recoveryimage -j"$(nproc)" 2>&1 | tail -50
+          mka recoveryimage -j"$(nproc)" 2>&1 | tail -100
+          
+          # 打印 ccache 统计
+          ccache -s
 
       - name: 上传产物
         if: success()
