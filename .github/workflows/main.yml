@@ -7,7 +7,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      GIT_TERMINAL_PROMPT: 0
     steps:
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost /opt/hostedtoolcache \
+                      /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker rmi $(sudo docker images -aq) 2>/dev/null || true
+          df -h /
 
       - name: 安装编译依赖
         run: |
@@ -15,14 +24,70 @@ jobs:
           sudo apt-get install -y repo git-core gnupg flex bison build-essential \
             zip curl zlib1g-dev libxml2-utils xsltproc unzip fontconfig \
             python3 bc lz4 lzop cpio rsync libssl-dev
+          git config --global user.email "ci@build.local"
+          git config --global user.name "ci"
+          git config --global credential.helper ""
 
-      - name: 同步 OrangeFox fox_14.1 源码
+      - name: 探路:裸克隆找出真实可用的 manifest 源
         run: |
-          mkdir -p ~/fox && cd ~/fox
-          repo init --depth=1 -u https://gitlab.com/orangefox/manifest.git -b fox_14.1
-          repo sync -c -j$(nproc) --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune
+          set +e
+          for url in \
+            https://gitlab.com/orangefox/manifest.git \
+            https://gitlab.com/orangefoxrecovery/manifest.git \
+            https://github.com/OrangeFoxRecovery/manifest.git \
+            https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git; do
+            echo "########## $url ##########"
+            rm -rf /tmp/mt
+            git clone --depth=1 "$url" /tmp/mt 2>&1 | tail -3
+            if [ -d /tmp/mt ]; then
+              echo ">>> 可用! 分支列表:"
+              git -C /tmp/mt branch -a
+              git ls-remote --heads "$url" | awk '{print $2}' | head -20
+            fi
+            echo ""
+          done
 
-      - name: 拉取 rothko device tree 并转成橙狐
+      - name: 同步源码
+        run: |
+          set +e
+          mkdir -p ~/fox && cd ~/fox
+
+          try_repo() {
+            url="$1"; br="$2"
+            echo "########## repo init $url -b $br ##########"
+            rm -rf .repo
+            repo init --depth=1 -u "$url" -b "$br" || return 1
+            repo sync -c -j"$(nproc)" --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune || return 1
+            [ -d build ] && [ -d bootable ]
+          }
+
+          OK=0
+          for url in https://gitlab.com/orangefox/manifest.git \
+                     https://gitlab.com/orangefoxrecovery/manifest.git \
+                     https://github.com/OrangeFoxRecovery/manifest.git; do
+            for br in fox_14.1 fox_15.0 fox_14.0 master main; do
+              if try_repo "$url" "$br"; then
+                echo "########## 成功: $url -b $br ##########"
+                OK=1; break 2
+              fi
+            done
+          done
+
+          if [ "$OK" != 1 ]; then
+            echo "!!!!!! 回退 TWRP 官方 minimal manifest !!!!!!"
+            rm -rf .repo
+            repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-14 || exit 1
+            repo sync -c -j"$(nproc)" --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune || exit 1
+            git clone --depth=1 -b fox_14.1 https://gitlab.com/orangefox/vendor.git vendor/fox \
+              || git clone --depth=1 https://github.com/OrangeFoxRecovery/vendor.git vendor/fox \
+              || echo "vendor/fox 拉不到,按纯 TWRP 编译"
+          fi
+          echo "=== 源码树 ==="
+          ls
+          ls vendor/ 2>/dev/null
+          exit 0
+
+      - name: 拉取 rothko device tree 并转橙狐
         run: |
           cd ~/fox
           git clone --depth=1 \
@@ -31,20 +96,33 @@ jobs:
           cd device/xiaomi/rothko
           echo "=== 原始 mk 文件 ==="
           ls *.mk
-          SRC=$(ls twrp_rothko.mk omni_rothko.mk 2>/dev/null | head -1)
-          echo "源产品文件: $SRC"
-          # 转换成橙狐:换 vendor 配置 + 改名
-          sed -e 's#vendor/twrp/config/common.mk#vendor/fox/config/common.mk#g' \
-              -e 's#vendor/lineage/config/common.mk#vendor/fox/config/common.mk#g' \
-              -e 's#PRODUCT_NAME := .*#PRODUCT_NAME := fox_rothko#' "$SRC" > fox_rothko.mk
-          echo "=== 生成的 fox_rothko.mk ==="
-          cat fox_rothk
+          if [ -d ~/fox/vendor/fox ]; then
+            SRC=$(ls twrp_rothko.mk omni_rothko.mk 2>/dev/null | head -1)
+            echo "源产品文件: $SRC (转橙狐)"
+            sed -e 's#vendor/twrp/config/common.mk#vendor/fox/config/common.mk#g' \
+                -e 's#vendor/lineage/config/common.mk#vendor/fox/config/common.mk#g' \
+                -e 's#PRODUCT_NAME := .*#PRODUCT_NAME := fox_rothko#' "$SRC" > fox_rothko.mk
+            cat fox_rothko.mk
+            {
+              echo '#!/bin/bash'
+              echo 'export FOX_BUILD_TYPE=Beta'
+              echo 'export OF_MAINTAINER="rothko-port"'
+              echo 'export OF_USE_MAGISKBOOT=1'
+            } > vendorsetup.sh
+          else
+            echo "无 vendor/fox,按 TWRP 编译"
+          fi
+
+      - name: 编译
+        run: |
+          cd ~/fox
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
           source build/envsetup.sh
-          lunch fox_rothko-eng
-          # recovery 合并进 boot 的机器产物是 boot.img;失败则试 recoveryimage
-          mka bootimage -j$(nproc) || mka recoveryimage -j$(nproc)
+          COMBO=$(ls device/xiaomi/rothko/ | grep -oE '^(fox|twrp|omni)_rothko' | head -1)
+          echo "lunch combo: ${COMBO}-eng"
+          lunch ${COMBO}-eng
+          mka bootimage -j"$(nproc)" || mka recoveryimage -j"$(nproc)"
           echo "=== 产物 ==="
           ls -la out/target/product/rothko/*.img
 
