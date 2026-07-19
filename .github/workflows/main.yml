@@ -114,47 +114,56 @@ jobs:
             echo "无 vendor/fox,按 TWRP 编译"
           fi
 
+
       - name: 编译
         run: |
           cd ~/fox
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
-          source build/envsetup.sh
-          COMBO=$(ls device/xiaomi/rothko/ | grep -oE '^(fox|twrp|omni)_rothko' | head -1)
-          echo "combo: $COMBO"
-          LUNCH_OK=0
-          for rel in ap2a ap3a ap4a ap1a; do
-            echo "### 尝试 lunch ${COMBO}-${rel}-eng"
-            if lunch ${COMBO}-${rel}-eng; then
-              echo "lunch 成功: ${COMBO}-${rel}-eng"
-              LUNCH_OK=1
-              break
-            fi
-          done
-          if [ "$LUNCH_OK" != 1 ]; then
-            echo "新版三段式全失败,退回旧式 lunch"
-            lunch ${COMBO}-eng || exit 1
-          fi
-          mka bootimage -j"$(nproc)" || mka recoveryimage -j"$(nproc)"
-          echo "=== 产
-          ls -la out/target/product/rothko/*.img
 
+          echo "=== 构建系统诊断 ==="
+          echo "--- AndroidProducts.mk ---"
+          cat device/xiaomi/rothko/AndroidProducts.mk
+          echo "--- 产品名映射 ---"
+          grep -E 'PRODUCT_NAME|PRODUCT_DEVICE|COMMON_LUNCH' device/xiaomi/rothko/*.mk
+          echo "--- release configs ---"
+          ls build/release/ 2>/dev/null || echo "no build/release/"
+          find build -path '*/release/*' -name '*.mk' 2>/dev/null | head -10
+          echo "--- AOSP 版本 ---"
+          grep -E 'PLATFORM_VERSION\b' build/core/version_defaults.mk 2>/dev/null | head -3
+          echo "--- .repo/manifests 的 branch ---"
+          git -C .repo/manifests branch -a 2>/dev/null | head -5
+
+          source build/envsetup.sh
+
+          echo "=== envsetup 注册的产品 ==="
+          gettop >/dev/null 2>&1 && echo "TOP=$(gettop)" || echo "gettop failed"
+
+          echo "=== 尝试 lunch combos ==="
           LUNCH_OK=0
-          for rel in ap2a ap3a ap4a ap1a; do
-            echo "### 尝试 lunch ${COMBO}-${rel}-eng"
-            if lunch $
-              echo "lunch 成功: ${COMBO}-${rel}-eng"
-              LUNCH_OK
-              break
-            fi
+          # 新式三段 (product-release-variant)
+          for prod in twrp_rothko omni_rothko; do
+            for rel in ap2a ap3a ap4a ap1a; do
+              echo "### lunch ${prod}-${rel}-eng"
+              if lunch ${prod}-${rel}-eng 2>&1; then
+                LUNCH_OK=1; break 2
+              fi
+            done
           done
-          if [ "$LUNCH
-            echo "新版三段式全失败,退回旧式 lunch"
-            lunch ${COMBO}-eng || exit 1
+          # 旧式两段 (product-variant)
+          if [ "$LUNCH_OK" != 1 ]; then
+            for prod in twrp_rothko omni_rothko; do
+              echo "### lunch ${prod}-eng (old style)"
+              if lunch ${prod}-eng 2>&1; then
+                LUNCH_OK=1; break
+              fi
+            done
           fi
+          [ "$LUNCH_OK" = 1 ] || exit 1
+
           mka bootimage -j"$(nproc)" || mka recoveryimage -j"$(nproc)"
           echo "=== 产物 ==="
-          ls -la out/t
+          ls -la out/target/product/rothko/*.img 2>/dev/null
 
       - name: 上传产物
         if: always()
