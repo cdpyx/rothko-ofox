@@ -121,11 +121,40 @@ jobs:
           export LC_ALL=C
           source build/envsetup.sh
           COMBO=$(ls device/xiaomi/rothko/ | grep -oE '^(fox|twrp|omni)_rothko' | head -1)
-          echo "lunch combo: ${COMBO}-eng"
-          lunch ${COMBO}-eng
+          echo "combo: $COMBO"
+          LUNCH_OK=0
+          for rel in ap2a ap3a ap4a ap1a; do
+            echo "### 尝试 lunch ${COMBO}-${rel}-eng"
+            if lunch ${COMBO}-${rel}-eng; then
+              echo "lunch 成功: ${COMBO}-${rel}-eng"
+              LUNCH_OK=1
+              break
+            fi
+          done
+          if [ "$LUNCH_OK" != 1 ]; then
+            echo "新版三段式全失败,退回旧式 lunch"
+            lunch ${COMBO}-eng || exit 1
+          fi
+          mka bootimage -j"$(nproc)" || mka recoveryimage -j"$(nproc)"
+          echo "=== 产
+          ls -la out/target/product/rothko/*.img
+
+          LUNCH_OK=0
+          for rel in ap2a ap3a ap4a ap1a; do
+            echo "### 尝试 lunch ${COMBO}-${rel}-eng"
+            if lunch $
+              echo "lunch 成功: ${COMBO}-${rel}-eng"
+              LUNCH_OK
+              break
+            fi
+          done
+          if [ "$LUNCH
+            echo "新版三段式全失败,退回旧式 lunch"
+            lunch ${COMBO}-eng || exit 1
+          fi
           mka bootimage -j"$(nproc)" || mka recoveryimage -j"$(nproc)"
           echo "=== 产物 ==="
-          ls -la out/target/product/rothko/*.img
+          ls -la out/t
 
       - name: 上传产物
         if: always()
