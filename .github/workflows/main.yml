@@ -18,72 +18,73 @@ jobs:
           sudo docker rmi $(sudo docker images -aq) 2>/dev/null || true
           df -h /
 
-      - name: 安装编译依赖
+      - name: 安装依赖 + 最新 repo 工具
         run: |
           sudo apt-get update
-          sudo apt-get install -y repo git-core gnupg flex bison build-essential \
+          sudo apt-get install -y git-core gnupg flex bison build-essential \
             zip curl zlib1g-dev libxml2-utils xsltproc unzip fontconfig \
             python3 bc lz4 lzop cpio rsync libssl-dev
+          # apt 源的 repo 太老,装官方最新版
+          sudo curl -sL -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          sudo chmod +x /usr/local/bin/repo
+          hash -r
+          repo --version
           git config --global user.email "ci@build.local"
           git config --global user.name "ci"
           git config --global credential.helper ""
 
-      - name: 探路:裸克隆找出真实可用的 manifest 源
-        run: |
-          set +e
-          for url in \
-            https://gitlab.com/orangefox/manifest.git \
-            https://gitlab.com/orangefoxrecovery/manifest.git \
-            https://github.com/OrangeFoxRecovery/manifest.git \
-            https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git; do
-            echo "########## $url ##########"
-            rm -rf /tmp/mt
-            git clone --depth=1 "$url" /tmp/mt 2>&1 | tail -3
-            if [ -d /tmp/mt ]; then
-              echo ">>> 可用! 分支列表:"
-              git -C /tmp/mt branch -a
-              git ls-remote --heads "$url" | awk '{print $2}' | head -20
-            fi
-            echo ""
-          done
-
-      - name: 同步源码
+      - name: 打底:TWRP 官方 minimal manifest (twrp-14)
         run: |
           set +e
           mkdir -p ~/fox && cd ~/fox
-
-          try_repo() {
-            url="$1"; br="$2"
-            echo "########## repo init $url -b $br ##########"
-            rm -rf .repo
-            repo init --depth=1 -u "$url" -b "$br" || return 1
-            repo sync -c -j"$(nproc)" --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune || return 1
-            [ -d build ] && [ -d bootable ]
-          }
-
           OK=0
-          for url in https://gitlab.com/orangefox/manifest.git \
-                     https://gitlab.com/orangefoxrecovery/manifest.git \
-                     https://github.com/OrangeFoxRecovery/manifest.git; do
-            for br in fox_14.1 fox_15.0 fox_14.0 master main; do
-              if try_repo "$url" "$br"; then
-                echo "########## 成功: $url -b $br ##########"
-                OK=1; break 2
+          for br in twrp-14 twrp-14.1 twrp-15; do
+            echo "########## repo init minimal-manifest -b $br ##########"
+            rm -rf .repo
+            repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b "$br" || continue
+            repo sync -c -j"$(nproc)" --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune || continue
+            [ -d build ] && [ -d bootable ] && { OK=1; echo "打底成功: $br"; break; }
+          done
+          [ "$OK" = 1 ] || { echo "TWRP manifest 也拉不到,无法继续"; exit 1; }
+
+      - name: 覆盖橙狐层 (vendor/fox + recovery fork)
+        run: |
+          set +e
+          cd ~/fox
+          # --- vendor/fox ---
+          FOXVEND=0
+          for url in https://gitlab.com/orangefox/vendor.git \
+                     https://github.com/OrangeFoxRecovery/vendor.git \
+                     https://github.com/OrangeFoxRecovery/fox_vendor.git; do
+            for br in fox_14.1 master main; do
+              echo "### 试 vendor: $url -b $br"
+              rm -rf /tmp/fv
+              if git clone --depth=1 -b "$br" "$url" /tmp/fv 2>&1 | tail -2; [ -d /tmp/fv ]; then
+                rm -rf vendor/fox
+                cp -a /tmp/fv vendor/fox
+                FOXVEND=1; echo "vendor/fox 成功: $url -b $br"
+                break 2
               fi
             done
           done
-
-          if [ "$OK" != 1 ]; then
-            echo "!!!!!! 回退 TWRP 官方 minimal manifest !!!!!!"
-            rm -rf .repo
-            repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-14 || exit 1
-            repo sync -c -j"$(nproc)" --force-sync --no-tags --no-clone-bundle --optimized-fetch --prune || exit 1
-            git clone --depth=1 -b fox_14.1 https://gitlab.com/orangefox/vendor.git vendor/fox \
-              || git clone --depth=1 https://github.com/OrangeFoxRecovery/vendor.git vendor/fox \
-              || echo "vendor/fox 拉不到,按纯 TWRP 编译"
-          fi
-          echo "=== 源码树 ==="
-          ls
+          # --- bootable/recovery 换成橙狐 fork ---
+          FOXREC=0
+          for url in https://gitlab.com/orangefox/recovery.git \
+                     https://github.com/OrangeFoxRecovery/bootable_recovery.git \
+                     https://github.com/OrangeFoxRecovery/recovery.git; do
+            for br in fox_14.1 master main; do
+              echo "### 试 recovery: $url -b $br"
+              rm -rf /tmp/fr
+              if git clone --depth=1 -b "$br" "$url" /tmp/fr 2>&1 | tail -2; [ -d /tmp/fr ]; then
+                rm -rf bootable/recovery
+                cp -a /tmp/fr bootable/recovery
+                FOXREC=1; echo "recovery fork 成功: $url -b $br"
+                break 2
+              fi
+            done
+          done
+          echo "======== 橙狐层状态: vendor=$FOXVEND recovery=$FOXREC ========"
+          echo "(都是0则按纯 TWRP 编译,功能一样)"
           ls vendor/ 2>/dev/null
           exit 0
 
