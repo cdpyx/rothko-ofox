@@ -45,28 +45,42 @@ jobs:
             libelf-dev libz-dev
           echo "java: $(java -version 2>&1 | head -1)"
 
+      # ================= 缓存 .repo 目录以加速同步 =================
+      - name: 缓存 TWRP .repo (加速同步)
+        id: cache-repo
+        uses: actions/cache@v4
+        with:
+          path: ~/fox/.repo
+          key: twrp-repo-${{ inputs.manifest_branch }}-${{ github.run_id }}
+          restore-keys: |
+            twrp-repo-${{ inputs.manifest_branch }}-
+      # ==================================================================
+
       - name: 同步 TWRP 源码
         run: |
           set -eo pipefail
           mkdir -p ~/fox && cd ~/fox
+          
           echo "=== repo init (branch: ${{ inputs.manifest_branch }}) ==="
-          # 修正：使用正确的 AOSP manifest 仓库
           repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
             -b ${{ inputs.manifest_branch }} \
             --depth=1 2>&1 | tail -5
-          echo "=== repo sync (may take 30-60 min) ==="
+            
+          echo "=== repo sync (利用缓存加速) ==="
           repo sync -c --no-tags --no-clone-bundle --force-sync -j$(nproc) 2>&1 | tail -30
+          
+          echo "=== 优化缓存体积 (Git GC) ==="
+          repo forall -c 'git gc --prune=now' 2>/dev/null || true
+          
           echo "=== 验证同步完整性 ==="
           if [ ! -f build/envsetup.sh ] && [ ! -f build/make/envsetup.sh ]; then
             echo "!!! envsetup.sh 不存在，repo sync 不完整，重试一次..."
             repo sync -c --force-sync -j$(nproc) 2>&1 | tail -30
           fi
-          echo "=== 关键文件检查 ==="
-          ls -la build/envsetup.sh build/make/envsetup.sh 2>/dev/null || echo "!! 仍缺少 envsetup.sh"
-          ls build/ 2>/dev/null | head -20
           echo "=== 同步完成，磁盘使用 ==="
           df -h /
           du -sh ~/fox 2>/dev/null
+          du -sh ~/fox/.repo 2>/dev/null
 
       - name: 克隆 Device Tree
         run: |
@@ -80,23 +94,11 @@ jobs:
       - name: 诊断:构建系统检查
         run: |
           cd ~/fox
-          echo "=== twrp-14 manifest 分支 ==="
-          git -C build/make branch -a 2>/dev/null | head -5
-          echo ""
           echo "=== release 配置 ==="
-          ls build/release/ 2>/dev/null || echo "build/release/ 不存在"
-          find build -path '*/release*' -name '*.mk' 2>/dev/null | head -10
-          echo ""
-          echo "=== AOSP 版本 ==="
-          grep -E 'PLATFORM_VERSION\b' build/core/version_defaults.mk 2>/dev/null | head -3 || \
-            grep -rE 'PLATFORM_VERSION\b' build/make/core/version_defaults.mk 2>/dev/null | head -3 || \
-            echo "version_defaults.mk 未找到"
+          ls build/release/release_configs/ 2>/dev/null || echo "build/release/release_configs/ 不存在"
           echo ""
           echo "=== device tree AndroidProducts.mk ==="
-          cat device/xiaomi/rothko/AndroidProducts.mk
-          echo ""
-          echo "=== BoardConfig 中的 release/target 相关 ==="
-          grep -iE 'release|target_product|common_lunch' device/xiaomi/rothko/BoardConfig.mk 2>/dev/null | head -10
+          cat device/xiaomi/rothko/AndroidProducts.mk 2>/dev/null || echo "未找到 AndroidProducts.mk"
 
       - name: 补全 release config 并编译
         run: |
@@ -104,52 +106,37 @@ jobs:
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
 
-          # ---- 补全 TWRP manifest 缺失的 release config ----
-          if [ ! -d build/release ]; then
-            echo ">>> build/release/ 不存在，创建最小 release config"
-            mkdir -p build/release/release_configs
-            for rel in ap1a ap2a ap3a ap4a; do
-              cat > "build/release/release_configs/${rel}.mk" <<'RELEOF'
-          PRODUCT_SOONG_NAMESPACES += build/release
-          $(call inherit-product, build/make/target/product/aosp_product.mk)
-          RELEASE_DEFAULT_PRODUCT := aosp_product
-          RELEOF
-            done
-            echo ">>> 已创建: $(ls build/release/release_configs/)"
-          else
-            echo ">>> build/release/ 已存在: $(ls build/release/release_configs/ 2>/dev/null)"
-          fi
+          # ---- 强制补全 TWRP manifest 缺失的 release config ----
+          # 修复：移除 Heredoc，改用 echo 避免 YAML 缩进导致的 Bash 语法错误
+          mkdir -p build/release/release_configs
+          for rel in ap1a ap2a ap3a ap4a; do
+            if [ ! -f "build/release/release_configs/${rel}.mk" ]; then
+              echo ">>> 创建缺失的 release config: ${rel}.mk"
+              echo "# Dummy release config for TWRP build" > "build/release/release_configs/${rel}.mk"
+              echo "RELEASE_DEFAULT_PRODUCT := aosp_product" >> "build/release/release_configs/${rel}.mk"
+            fi
+          done
+          echo ">>> 当前 release configs: $(ls build/release/release_configs/)"
 
           # ---- 初始化构建环境 ----
           ENVSETUP=""
           if [ -f build/envsetup.sh ]; then
             ENVSETUP="build/envsetup.sh"
           elif [ -f build/make/envsetup.sh ]; then
-            echo ">>> build/envsetup.sh 不存在，使用 build/make/envsetup.sh"
             ENVSETUP="build/make/envsetup.sh"
           else
-            echo "!!! envsetup.sh 完全不存在！build/ 目录内容:"
-            ls -la build/ 2>/dev/null | head -10
-            echo ">>> 重新运行 repo sync..."
-            repo sync -c build build/make --force-sync 2>&1 | tail -10
-            if [ -f build/envsetup.sh ]; then
-              ENVSETUP="build/envsetup.sh"
-            elif [ -f build/make/envsetup.sh ]; then
-              ENVSETUP="build/make/envsetup.sh"
-            else
-              echo "!!! repo sync 后仍无 envsetup.sh，终止"
-              exit 1
-            fi
+            echo "!!! envsetup.sh 完全不存在！"
+            exit 1
           fi
           echo ">>> source $ENVSETUP"
           source "$ENVSETUP"
 
-          # ---- 尝试 lunch ----
+          # ---- 尝试 lunch (改进检测逻辑) ----
           LUNCH_OK=0
           for rel in ap1a ap2a ap3a ap4a; do
-            echo ""
-            echo ">>> lunch twrp_rothko-${rel}-eng"
-            if lunch twrp_rothko-${rel}-eng 2>&1; then
+            echo ">>> 尝试 lunch twrp_rothko-${rel}-eng"
+            lunch twrp_rothko-${rel}-eng > /tmp/lunch_out.txt 2>&1
+            if [ -n "$TARGET_PRODUCT" ] && [ "$TARGET_PRODUCT" = "twrp_rothko" ]; then
               echo ">>> SUCCESS: twrp_rothko-${rel}-eng"
               LUNCH_OK=1
               break
@@ -157,13 +144,11 @@ jobs:
           done
 
           if [ "$LUNCH_OK" != 1 ]; then
-            echo ""
-            echo ">>> 新式 lunch 全部失败"
-            echo ">>> 尝试旧式两段 product-variant"
+            echo ">>> 新式 lunch 失败，尝试旧式两段式"
             for combo in twrp_rothko-eng omni_rothko-eng; do
-              echo ""
-              echo ">>> lunch ${combo}"
-              if lunch ${combo} 2>&1; then
+              echo ">>> 尝试 lunch ${combo}"
+              lunch ${combo} > /tmp/lunch_out.txt 2>&1
+              if [ -n "$TARGET_PRODUCT" ] && [[ "$TARGET_PRODUCT" == *"rothko"* ]]; then
                 echo ">>> SUCCESS: ${combo}"
                 LUNCH_OK=1
                 break
@@ -172,18 +157,16 @@ jobs:
           fi
 
           if [ "$LUNCH_OK" != 1 ]; then
-            echo ""
             echo "!!! 所有 lunch 组合均失败"
-            echo "=== 已注册的 lunch choices ==="
-            get_build_var COMMON_LUNCH_CHOICES 2>/dev/null || echo "get_build_var failed"
+            echo "=== Lunch 输出日志 ==="
+            cat /tmp/lunch_out.txt
             exit 1
           fi
 
           # ---- 编译 ----
           echo ""
           echo ">>> 开始编译 (CPU cores: $(nproc))"
-          mka bootimage -j"$(nproc)" 2>&1 | tail -30 || \
-            mka recoveryimage -j"$(nproc)" 2>&1 | tail -30
+          mka recoveryimage -j"$(nproc)" 2>&1 | tail -50
 
       - name: 上传产物
         if: success()
